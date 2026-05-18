@@ -635,7 +635,7 @@ class BatchRenameApp:
 
         new_names = []
 
-        for f in filtered_files:
+        for i, f in enumerate(filtered_files):
             name = f["name"]
             base, ext = os.path.splitext(name)
 
@@ -665,8 +665,7 @@ class BatchRenameApp:
                 except ValueError:
                     messagebox.showerror("错误", "起始序号和位数必须是数字！")
                     return None
-                idx = filtered_files.index(f)
-                num = str(start_num + idx).zfill(digits)
+                num = str(start_num + i).zfill(digits)
                 # 基础名称为空时，直接用序号；否则用基础名称+序号
                 base = f"{base_name}{num}" if base_name else num
 
