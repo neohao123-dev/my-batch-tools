@@ -1,10 +1,80 @@
 import os
 import tempfile
+import tkinter as tk
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from batch_rename import BatchRenameApp
+
+
+class FileTreeStub:
+    """记录列表交互，供排序、选择和拖动事件测试使用。"""
+
+    def __init__(self):
+        self.rows = {}
+        self.selected = []
+        self.cursor = ""
+
+    def get_children(self):
+        return list(self.rows)
+
+    def insert(self, parent, position, iid, values):
+        self.rows[iid] = {"values": values, "tags": ()}
+        return iid
+
+    def delete(self, row):
+        del self.rows[row]
+        self.selected = [item for item in self.selected if item != row]
+
+    def selection(self):
+        return tuple(self.selected)
+
+    def selection_set(self, rows):
+        self.selected = [rows] if isinstance(rows, str) else list(rows)
+
+    def focus(self, row):
+        self.focused = row
+
+    def focus_set(self):
+        pass
+
+    def see(self, row):
+        self.seen = row
+
+    def item(self, row, option=None, **values):
+        self.rows[row].update(values)
+        return self.rows[row][option] if option else self.rows[row]
+
+    def tag_configure(self, *args, **kwargs):
+        pass
+
+    def index(self, row):
+        return list(self.rows).index(row)
+
+    def bbox(self, row):
+        return 0, 30 + self.index(row) * 30, 600, 30
+
+    def identify_row(self, y):
+        index = (y - 30) // 30
+        rows = list(self.rows)
+        return rows[index] if 0 <= index < len(rows) else ""
+
+    def identify_region(self, x, y):
+        return "heading" if y < 30 else "cell" if self.identify_row(y) else "nothing"
+
+    def exists(self, row):
+        return row in self.rows
+
+    def configure(self, **values):
+        self.cursor = values.get("cursor", self.cursor)
+
+    def winfo_height(self):
+        return 600
+
+    def yview_scroll(self, *args):
+        pass
 
 
 class RenameTests(unittest.TestCase):
@@ -19,11 +89,18 @@ class RenameTests(unittest.TestCase):
         self.app.selection_mode = "directory"
         self.app.files = []
         self.app.rename_history = []
+        self.app.root = Mock()
+        self.app._import_order = {}
+        self.app._tree_files = {}
+        self.app._preview_active = False
+        self.app._drag_state = None
+        self.app._drag_scroll_job = None
+        self.app.sort_mode = self.variable("手动排序")
         for feature in (
             "reverse", "delete_text", "replace", "prefix", "suffix",
             "sequence", "regex", "case", "ext",
         ):
-            setattr(self.app, "enable_" + feature, Mock(get=Mock(return_value=False)))
+            setattr(self.app, "enable_" + feature, self.variable(False))
         self.app.enable_ext.get.return_value = True
         self.app.entry_new_ext = Mock(get=Mock(return_value=".JPG"))
         for entry, value in {
@@ -44,6 +121,19 @@ class RenameTests(unittest.TestCase):
         self.messages = messages.start()
         self.addCleanup(messages.stop)
         self.messages.askyesno.return_value = True
+
+    @staticmethod
+    def variable(value):
+        variable = Mock(get=Mock(return_value=value))
+        def set_value(value):
+            variable.get.return_value = value
+        variable.set.side_effect = set_value
+        return variable
+
+    def use_file_tree(self):
+        del self.app._update_file_tree
+        self.app.file_tree = FileTreeStub()
+        self.app.colors = {"preview_new": "green"}
 
     def add_file(self, name, content=b"original image content"):
         path = self.folder / name
@@ -93,6 +183,7 @@ class RenameTests(unittest.TestCase):
         del self.app._update_file_tree
         self.app.file_tree = Mock()
         self.app.file_tree.get_children.return_value = []
+        self.app.file_tree.selection.return_value = []
         self.app.colors = {"preview_new": "green"}
 
         self.app._preview_rename()
@@ -494,6 +585,195 @@ class RenameTests(unittest.TestCase):
                 self.configure("regex", entry_regex=pattern, entry_regex_replace=replacement)
                 self.assertIsNone(self.app._generate_new_names())
 
+    def test_folder_import_uses_natural_number_order(self):
+        for name in ("10.jpg", "2.jpg", "1.jpg", "20.jpg"):
+            self.add_file(name)
+        self.app._load_files()
+        self.assertEqual([f["name"] for f in self.app.files], ["1.jpg", "2.jpg", "10.jpg", "20.jpg"])
+
+    def test_sort_choices_order_files_by_name_time_size_and_extension(self):
+        for name, content, timestamp in (
+            ("file10.JPG", b"1", 300000),
+            ("file2.txt", b"222", 100000),
+            ("file1.png", b"33", 200000),
+        ):
+            path = self.add_file(name, content)
+            os.utime(path, (timestamp, timestamp))
+        self.app._load_files()
+        cases = {
+            "名称：自然顺序": ["file1.png", "file2.txt", "file10.JPG"],
+            "名称：自然倒序": ["file10.JPG", "file2.txt", "file1.png"],
+            "修改时间：从旧到新": ["file2.txt", "file1.png", "file10.JPG"],
+            "修改时间：从新到旧": ["file10.JPG", "file1.png", "file2.txt"],
+            "大小：从小到大": ["file10.JPG", "file1.png", "file2.txt"],
+            "大小：从大到小": ["file2.txt", "file1.png", "file10.JPG"],
+            "扩展名：A → Z": ["file10.JPG", "file1.png", "file2.txt"],
+        }
+        for mode, expected in cases.items():
+            with self.subTest(mode=mode):
+                self.app.sort_mode.set(mode)
+                self.app._apply_sort()
+                self.assertEqual([f["name"] for f in self.app.files], expected)
+
+    def test_column_heading_toggles_ascending_and_descending(self):
+        self.add_file("a.txt", b"a")
+        self.add_file("b.txt", b"bb")
+        self.app._load_files()
+        self.app._sort_by_column("size")
+        self.assertEqual([f["name"] for f in self.app.files], ["a.txt", "b.txt"])
+        self.app._sort_by_column("size")
+        self.assertEqual([f["name"] for f in self.app.files], ["b.txt", "a.txt"])
+
+    def test_multi_selection_movement_preserves_relative_order(self):
+        for name in "abcde":
+            self.add_file(name + ".txt")
+        self.app._load_files()
+        original = list(self.app.files)
+        selected = [str(self.folder / "b.txt"), str(self.folder / "d.txt")]
+        cases = { -1: "badce", 1: "acbed", "top": "bdace", "bottom": "acebd" }
+        for direction, expected in cases.items():
+            with self.subTest(direction=direction):
+                self.app.files = list(original)
+                self.assertTrue(self.app._move_files(selected, direction))
+                self.assertEqual([f["name"][0] for f in self.app.files], list(expected))
+        self.app.files = list(original)
+        self.assertFalse(self.app._move_files([str(self.folder / "a.txt")], -1))
+        self.assertFalse(self.app._move_files([str(self.folder / "e.txt")], 1))
+
+    def test_filtered_reorder_keeps_hidden_files_in_place(self):
+        for name in ("a.jpg", "a.txt", "b.jpg", "b.txt"):
+            self.add_file(name)
+        self.app._load_files()
+        self.app.filter_ext.get.return_value = "jpg"
+        self.app._reorder_files([str(self.folder / "b.jpg")], 0)
+        self.assertEqual([f["name"] for f in self.app.files], ["b.jpg", "a.txt", "a.jpg", "b.txt"])
+        self.assertEqual([f["name"] for f in self.app._get_ordered_files()], ["b.jpg", "a.jpg"])
+
+    def test_drag_updates_preview_selection_and_execution_order(self):
+        self.use_file_tree()
+        for name in "abc":
+            self.add_file(name + ".txt", name.encode())
+        self.app._load_files()
+        self.configure("sequence", entry_base_name="image", entry_digits="1")
+        self.app._preview_rename()
+        self.app._on_drag_start(SimpleNamespace(x=100, y=45, state=0))
+        self.app._on_drag_motion(SimpleNamespace(x=100, y=115))
+        self.app._on_drag_end(SimpleNamespace(x=100, y=115))
+        rows = list(self.app.file_tree.rows.values())
+        self.assertEqual([(r["values"][1], r["values"][2]) for r in rows], [
+            ("b.txt", "image1.txt"), ("c.txt", "image2.txt"), ("a.txt", "image3.txt"),
+        ])
+        self.assertEqual(self.app._selected_file_paths(), [str(self.folder / "a.txt")])
+        self.app._execute_rename()
+        self.assertEqual(self.snapshot(), {"image1.txt": b"b", "image2.txt": b"c", "image3.txt": b"a"})
+        self.assertEqual([f["name"] for f in self.app.files], ["image1.txt", "image2.txt", "image3.txt"])
+        self.app._undo_last_rename()
+        self.assertEqual([f["name"] for f in self.app.files], ["b.txt", "c.txt", "a.txt"])
+
+    def test_drag_moves_multiple_rows_as_one_group(self):
+        self.use_file_tree()
+        for name in "abcd":
+            self.add_file(name + ".txt")
+        self.app._load_files()
+        self.app.file_tree.selection_set(["file2", "file3"])
+        self.app._on_drag_start(SimpleNamespace(x=100, y=75, state=0))
+        self.app._on_drag_motion(SimpleNamespace(x=100, y=145))
+        self.app._on_drag_end(SimpleNamespace(x=100, y=145))
+        self.assertEqual([f["name"] for f in self.app.files], ["a.txt", "d.txt", "b.txt", "c.txt"])
+        self.assertEqual(self.app._selected_file_paths(), [str(self.folder / "b.txt"), str(self.folder / "c.txt")])
+
+    def test_cancelled_drag_does_not_change_order(self):
+        self.use_file_tree()
+        self.add_file("a.txt")
+        self.add_file("b.txt")
+        self.app._load_files()
+        self.app._on_drag_start(SimpleNamespace(x=100, y=45, state=0))
+        self.app._on_drag_motion(SimpleNamespace(x=100, y=85))
+        self.app._cancel_drag()
+        self.assertIsNone(self.app._drag_state)
+        self.assertEqual(self.app.file_tree.cursor, "")
+        self.assertEqual([f["name"] for f in self.app.files], ["a.txt", "b.txt"])
+        self.assertTrue(all("drop_target" not in row["tags"] for row in self.app.file_tree.rows.values()))
+
+    def test_small_mouse_movement_does_not_reorder_and_ctrl_click_is_native(self):
+        self.use_file_tree()
+        self.add_file("a.txt")
+        self.add_file("b.txt")
+        self.app._load_files()
+        self.app._on_drag_start(SimpleNamespace(x=100, y=45, state=0))
+        self.app._on_drag_motion(SimpleNamespace(x=101, y=46))
+        self.assertFalse(self.app._drag_state["active"])
+        self.app._on_drag_end(SimpleNamespace(x=101, y=46))
+        self.assertIsNone(self.app._on_drag_start(SimpleNamespace(x=100, y=75, state=4)))
+        self.assertIsNone(self.app._drag_state)
+        self.assertEqual([f["name"] for f in self.app.files], ["a.txt", "b.txt"])
+
+    def test_drag_near_edge_schedules_scrolling_and_cancels_it(self):
+        self.use_file_tree()
+        self.add_file("a.txt")
+        self.add_file("b.txt")
+        self.app._load_files()
+        self.app._on_drag_start(SimpleNamespace(x=100, y=75, state=0))
+        self.app._on_drag_motion(SimpleNamespace(x=100, y=32))
+        self.app.root.after.assert_called_once_with(120, self.app._autoscroll_drag)
+        self.app._cancel_drag()
+        self.app.root.after_cancel.assert_called_once()
+
+    def test_manual_move_when_reversed_keeps_displayed_order(self):
+        for name in "abc":
+            self.add_file(name + ".txt")
+        self.app._load_files()
+        self.app.enable_reverse.set(True)
+        self.app._move_files([str(self.folder / "b.txt")], -1)
+        self.assertFalse(self.app.enable_reverse.get())
+        self.assertEqual([f["name"] for f in self.app._get_ordered_files()], ["b.txt", "c.txt", "a.txt"])
+
+    def test_refresh_keeps_manual_order_and_appends_new_files(self):
+        for name in "abc":
+            self.add_file(name + ".txt")
+        self.app._load_files()
+        self.app._reorder_files([str(self.folder / "c.txt")], 0)
+        self.add_file("0.txt")
+        self.app._refresh_files()
+        self.assertEqual([f["name"] for f in self.app.files], ["c.txt", "a.txt", "b.txt", "0.txt"])
+        (self.folder / "a.txt").unlink()
+        self.app._refresh_files()
+        self.assertEqual([f["name"] for f in self.app.files], ["c.txt", "b.txt", "0.txt"])
+
+    def test_restore_import_order_still_works_after_renaming(self):
+        for name in "abc":
+            self.add_file(name + ".txt", name.encode())
+        self.app._load_files()
+        self.app._reorder_files([str(self.folder / "c.txt")], 0)
+        self.configure("sequence", entry_base_name="image", entry_digits="1")
+        self.app._execute_rename()
+        self.app._restore_import_order()
+        self.assertEqual([Path(f["path"]).read_bytes() for f in self.app.files], [b"a", b"b", b"c"])
+        self.app._undo_last_rename()
+        self.assertEqual([f["name"] for f in self.app.files], ["a.txt", "b.txt", "c.txt"])
+
+    def test_selected_file_mode_keeps_custom_order_after_refresh(self):
+        for name in "abc":
+            self.add_file(name + ".txt")
+        self.app._load_files()
+        self.app.selection_mode = "files"
+        self.app.current_dir = ""
+        self.app._reorder_files([str(self.folder / "c.txt")], 0)
+        self.app._refresh_files()
+        self.assertEqual([f["name"] for f in self.app.files], ["c.txt", "a.txt", "b.txt"])
+
+    def test_reorder_buttons_keep_selection(self):
+        self.use_file_tree()
+        for name in "abc":
+            self.add_file(name + ".txt")
+        self.app._load_files()
+        self.app.file_tree.selection_set("file2")
+        self.app._move_selected("top")
+        self.assertEqual([f["name"] for f in self.app.files], ["b.txt", "a.txt", "c.txt"])
+        self.assertEqual(self.app._selected_file_paths(), [str(self.folder / "b.txt")])
+        self.app._move_selected("bottom")
+        self.assertEqual([f["name"] for f in self.app.files], ["a.txt", "c.txt", "b.txt"])
+
     def test_mixed_extension_case_and_undo(self):
         originals = {
             "照片.jpg": b"lowercase",
@@ -603,6 +883,48 @@ class RenameTests(unittest.TestCase):
         self.assertEqual(source.read_bytes(), b"new unrelated file")
         self.assertEqual((self.folder / "photo.JPG").read_bytes(), b"original")
         self.messages.showerror.assert_called_once()
+
+
+class TkInterfaceTests(unittest.TestCase):
+    """在隐藏的 Tk 窗口内验证真实控件；不操作用户打开的窗口。"""
+
+    def setUp(self):
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.addCleanup(self.root.destroy)
+        self.app = BatchRenameApp(self.root)
+        folder = tempfile.TemporaryDirectory(prefix="rename_test_", dir=Path(__file__).resolve().parent)
+        self.addCleanup(folder.cleanup)
+        self.folder = Path(folder.name)
+        for name in ("1.jpg", "2.jpg", "10.jpg"):
+            (self.folder / name).write_bytes(name.encode())
+        self.app.current_dir = str(self.folder)
+        self.app._load_files()
+
+    def test_sort_and_drag_bindings_exist_on_real_tree(self):
+        self.assertIn("v2.2", self.root.title())
+        for event in ("<ButtonPress-1>", "<B1-Motion>", "<ButtonRelease-1>", "<Alt-Up>", "<Alt-Down>", "<Escape>"):
+            self.assertTrue(self.app.file_tree.bind(event), event)
+        for column in ("原文件名", "大小", "修改时间"):
+            self.assertTrue(self.app.file_tree.heading(column, "command"))
+        self.app._sort_by_column("name")
+        self.app._sort_by_column("name")
+        names = [self.app.file_tree.item(row, "values")[1] for row in self.app.file_tree.get_children()]
+        self.assertEqual(names, ["10.jpg", "2.jpg", "1.jpg"])
+
+    def test_real_selection_movement_recalculates_numbering_preview(self):
+        self.app.enable_sequence.set(True)
+        self.app.entry_base_name.insert(0, "image")
+        self.app._preview_rename()
+        self.app.file_tree.selection_set("file3")
+        self.app._move_selected("top")
+        rows = [self.app.file_tree.item(row, "values") for row in self.app.file_tree.get_children()]
+        self.assertEqual([(row[1], row[2]) for row in rows], [
+            ("10.jpg", "image001.jpg"), ("1.jpg", "image002.jpg"), ("2.jpg", "image003.jpg"),
+        ])
+        self.assertEqual(self.app._selected_file_paths(), [str(self.folder / "10.jpg")])
+        self.app._refresh_files()
+        self.assertEqual([f["name"] for f in self.app.files], ["10.jpg", "1.jpg", "2.jpg"])
 
 
 if __name__ == "__main__":

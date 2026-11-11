@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-批量文件重命名工具 v2.1
+批量文件重命名工具 v2.2
 Author: WorkBuddy
 Description: Windows 桌面版批量文件重命名软件 - 增强版
 支持多选功能组合、倒序排序、删除指定文字等
@@ -29,7 +29,7 @@ class BatchRenameApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("批量文件重命名工具 v2.1")
+        self.root.title("批量文件重命名工具 v2.2")
         self.root.geometry("1100x750")
         self.root.minsize(900, 650)
 
@@ -60,6 +60,12 @@ class BatchRenameApp:
         self.files = []
         self.rename_history = []
         self.selection_mode = "directory"
+        self._import_order = {}
+        self._tree_files = {}
+        self._preview_active = False
+        self._drag_state = None
+        self._drag_scroll_job = None
+        self.sort_mode = tk.StringVar(value="手动排序")
 
         # 功能开关变量
         self.enable_reverse = tk.BooleanVar(value=False)
@@ -233,7 +239,12 @@ class BatchRenameApp:
 
         # 绑定鼠标滚轮
         def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            widget = event.widget
+            while widget is not None:
+                if widget in (canvas, scrollable_frame):
+                    canvas.yview_scroll(int(-event.delta / 120), "units")
+                    return "break"
+                widget = getattr(widget, "master", None)
         canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
         parent = scrollable_frame
@@ -246,6 +257,7 @@ class BatchRenameApp:
             reverse_frame,
             text="🔄 倒序排列文件",
             variable=self.enable_reverse,
+            command=self._on_reverse_changed,
         ).pack(anchor=tk.W, pady=2)
 
         # ========== 删除指定文字 ==========
@@ -436,10 +448,42 @@ class BatchRenameApp:
         list_frame = ttk.LabelFrame(parent, text="文件列表", padding=5)
         list_frame.pack(fill=tk.BOTH, expand=True)
 
+        sorting = ttk.Frame(list_frame)
+        sorting.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(sorting, text="排序方式：").pack(side=tk.LEFT)
+        sort_choices = (
+            "手动排序", "名称：自然顺序", "名称：自然倒序",
+            "修改时间：从旧到新", "修改时间：从新到旧",
+            "大小：从小到大", "大小：从大到小", "扩展名：A → Z",
+        )
+        sort_combo = ttk.Combobox(
+            sorting, textvariable=self.sort_mode, values=sort_choices,
+            state="readonly", width=23,
+        )
+        sort_combo.pack(side=tk.LEFT, padx=(0, 8))
+        sort_combo.bind("<<ComboboxSelected>>", self._apply_sort)
+        ttk.Button(sorting, text="反转顺序", command=self._reverse_order).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(sorting, text="恢复导入顺序", command=self._restore_import_order).pack(side=tk.LEFT)
+
+        movement = ttk.Frame(list_frame)
+        movement.pack(fill=tk.X, pady=(0, 6))
+        for text, direction in (("↑ 上移", -1), ("↓ 下移", 1), ("移到顶部", "top"), ("移到底部", "bottom")):
+            ttk.Button(
+                movement, text=text,
+                command=lambda direction=direction: self._move_selected(direction),
+            ).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(
+            list_frame,
+            text="拖动文件行可调整顺序；Ctrl / Shift 多选，Alt + ↑ / ↓ 移动。排序只影响当前显示文件。",
+            foreground=self.colors["text_light"], wraplength=650,
+        ).pack(fill=tk.X, pady=(0, 6))
+
+        tree_frame = ttk.Frame(list_frame)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
         # 创建 Treeview
         columns = ("序号", "原文件名", "新文件名", "大小", "修改时间")
         self.file_tree = ttk.Treeview(
-            list_frame,
+            tree_frame,
             columns=columns,
             show="headings",
             style="FileTree.Treeview",
@@ -447,11 +491,11 @@ class BatchRenameApp:
         )
 
         # 设置列
-        self.file_tree.heading("序号", text="#")
-        self.file_tree.heading("原文件名", text="原文件名")
+        self.file_tree.heading("序号", text="↕ #")
+        self.file_tree.heading("原文件名", text="原文件名 ↕", command=lambda: self._sort_by_column("name"))
         self.file_tree.heading("新文件名", text="新文件名")
-        self.file_tree.heading("大小", text="大小")
-        self.file_tree.heading("修改时间", text="修改时间")
+        self.file_tree.heading("大小", text="大小 ↕", command=lambda: self._sort_by_column("size"))
+        self.file_tree.heading("修改时间", text="修改时间 ↕", command=lambda: self._sort_by_column("mtime"))
 
         self.file_tree.column("序号", width=40, anchor=tk.CENTER)
         self.file_tree.column("原文件名", width=200, anchor=tk.W)
@@ -461,19 +505,253 @@ class BatchRenameApp:
 
         # 滚动条
         scrollbar_y = ttk.Scrollbar(
-            list_frame, orient=tk.VERTICAL, command=self.file_tree.yview
+            tree_frame, orient=tk.VERTICAL, command=self.file_tree.yview
         )
         scrollbar_x = ttk.Scrollbar(
-            list_frame, orient=tk.HORIZONTAL, command=self.file_tree.xview
+            tree_frame, orient=tk.HORIZONTAL, command=self.file_tree.xview
         )
         self.file_tree.configure(
             yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set
         )
 
         # 布局
-        self.file_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
-        scrollbar_x.pack(side=tk.BOTTOM, fill=tk.X)
+        self.file_tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar_y.grid(row=0, column=1, sticky="ns")
+        scrollbar_x.grid(row=1, column=0, sticky="ew")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+        self.file_tree.tag_configure("drop_target", background="#dbeafe")
+        self.file_tree.bind("<ButtonPress-1>", self._on_drag_start)
+        self.file_tree.bind("<B1-Motion>", self._on_drag_motion)
+        self.file_tree.bind("<ButtonRelease-1>", self._on_drag_end)
+        self.file_tree.bind("<Escape>", self._cancel_drag)
+        self.file_tree.bind("<Alt-Up>", lambda event: self._move_selected(-1))
+        self.file_tree.bind("<Alt-Down>", lambda event: self._move_selected(1))
+
+    @staticmethod
+    def _natural_name_key(name):
+        parts = tuple(
+            (1, int(part)) if part.isdecimal() else (0, part.casefold())
+            for part in re.split(r"(\d+)", name)
+        )
+        return parts, name.casefold(), name
+
+    def _remember_import_order(self, reset=False):
+        if reset:
+            self._import_order = {}
+        next_index = max(self._import_order.values(), default=-1) + 1
+        for file_info in self.files:
+            key = self._path_key(file_info["path"])
+            if key not in self._import_order:
+                self._import_order[key] = next_index
+                next_index += 1
+
+    def _selected_file_paths(self):
+        if not self._tree_files:
+            return []
+        return [
+            self._tree_files[row]["path"] for row in self.file_tree.selection()
+            if row in self._tree_files
+        ]
+
+    def _set_visible_order(self, ordered_files):
+        """只替换可见文件的位置，过滤掉的文件保持原位。"""
+        visible_keys = {self._path_key(f["path"]) for f in self._get_ordered_files()}
+        new_keys = [self._path_key(f["path"]) for f in ordered_files]
+        if len(new_keys) != len(visible_keys) or set(new_keys) != visible_keys:
+            raise ValueError("排序后的文件必须与当前显示文件一致")
+        ordered = iter(ordered_files)
+        self.files = [
+            next(ordered) if self._path_key(f["path"]) in visible_keys else f
+            for f in self.files
+        ]
+        # 把屏幕上的顺序保存为实际顺序，避免手动调整后再次被倒序翻转。
+        self.enable_reverse.set(False)
+
+    def _redraw_order(self, selected_paths=None):
+        new_names = self._generate_new_names() if self._preview_active else None
+        self._update_file_tree(new_names, selected_paths=selected_paths)
+        self.status_var.set("顺序已更新；序号将按列表从上到下分配")
+
+    def _apply_sort(self, event=None):
+        mode = self.sort_mode.get()
+        if mode == "手动排序":
+            return
+        files = self._get_ordered_files()
+        selected = self._selected_file_paths()
+        name_key = lambda f: self._natural_name_key(f["name"])
+        if mode.startswith("名称"):
+            key = name_key
+        elif mode.startswith("修改时间"):
+            key = lambda f: (f["mtime"], name_key(f))
+        elif mode.startswith("大小"):
+            key = lambda f: (f["size"], name_key(f))
+        else:
+            key = lambda f: (os.path.splitext(f["name"])[1].casefold(), name_key(f))
+        descending = mode in ("名称：自然倒序", "修改时间：从新到旧", "大小：从大到小")
+        self._set_visible_order(sorted(files, key=key, reverse=descending))
+        self._redraw_order(selected)
+
+    def _sort_by_column(self, column):
+        modes = {
+            "name": ("名称：自然顺序", "名称：自然倒序"),
+            "size": ("大小：从小到大", "大小：从大到小"),
+            "mtime": ("修改时间：从旧到新", "修改时间：从新到旧"),
+        }
+        ascending, descending = modes[column]
+        self.sort_mode.set(descending if self.sort_mode.get() == ascending else ascending)
+        self._apply_sort()
+
+    def _reverse_order(self):
+        selected = self._selected_file_paths()
+        self._set_visible_order(self._get_ordered_files()[::-1])
+        self.sort_mode.set("手动排序")
+        self._redraw_order(selected)
+
+    def _restore_import_order(self):
+        selected = self._selected_file_paths()
+        self._set_visible_order(sorted(
+            self._get_ordered_files(),
+            key=lambda f: self._import_order[self._path_key(f["path"])],
+        ))
+        self.sort_mode.set("手动排序")
+        self._redraw_order(selected)
+
+    def _on_reverse_changed(self):
+        self.sort_mode.set("手动排序")
+        self._redraw_order(self._selected_file_paths())
+
+    def _move_files(self, selected_paths, direction):
+        files = list(self._get_ordered_files())
+        selected = {self._path_key(path) for path in selected_paths}
+        is_selected = lambda f: self._path_key(f["path"]) in selected
+        before = [self._path_key(f["path"]) for f in files]
+        if direction in ("top", "bottom"):
+            chosen = [f for f in files if is_selected(f)]
+            others = [f for f in files if not is_selected(f)]
+            files = chosen + others if direction == "top" else others + chosen
+        else:
+            indices = range(1, len(files)) if direction == -1 else range(len(files) - 2, -1, -1)
+            for index in indices:
+                neighbor = index + direction
+                if is_selected(files[index]) and not is_selected(files[neighbor]):
+                    files[index], files[neighbor] = files[neighbor], files[index]
+        if before == [self._path_key(f["path"]) for f in files]:
+            return False
+        self._set_visible_order(files)
+        return True
+
+    def _move_selected(self, direction):
+        selected = self._selected_file_paths()
+        if not selected:
+            self.status_var.set("请先在列表中选择要移动的文件（支持多选）")
+        elif self._move_files(selected, direction):
+            self.sort_mode.set("手动排序")
+            self._redraw_order(selected)
+            self.file_tree.focus_set()
+        return "break"
+
+    def _reorder_files(self, selected_paths, target_index):
+        files = self._get_ordered_files()
+        selected = {self._path_key(path) for path in selected_paths}
+        chosen = [f for f in files if self._path_key(f["path"]) in selected]
+        others = [f for f in files if self._path_key(f["path"]) not in selected]
+        target_index = max(0, min(target_index, len(files)))
+        insertion = sum(self._path_key(f["path"]) not in selected for f in files[:target_index])
+        ordered = others[:insertion] + chosen + others[insertion:]
+        if ordered == files:
+            return False
+        self._set_visible_order(ordered)
+        return True
+
+    def _on_drag_start(self, event):
+        self._cancel_drag()
+        row = self.file_tree.identify_row(event.y)
+        if self.file_tree.identify_region(event.x, event.y) != "cell" or row not in self._tree_files:
+            return
+        # Ctrl/Shift 点击保留 Treeview 原生多选行为。
+        if event.state & 0x0005:
+            return
+        if row not in self.file_tree.selection():
+            self.file_tree.selection_set(row)
+        self.file_tree.focus(row)
+        self.file_tree.focus_set()
+        self._drag_state = {
+            "paths": self._selected_file_paths(), "start_x": event.x, "start_y": event.y,
+            "pointer_y": event.y, "active": False, "target_index": None,
+            "target_row": None, "target_tags": (),
+        }
+        return "break"
+
+    def _clear_drop_target(self):
+        if self._drag_state and self._drag_state["target_row"]:
+            row = self._drag_state["target_row"]
+            if self.file_tree.exists(row):
+                self.file_tree.item(row, tags=self._drag_state["target_tags"])
+            self._drag_state["target_row"] = None
+
+    def _update_drop_target(self, y):
+        self._clear_drop_target()
+        row = self.file_tree.identify_row(y)
+        if row in self._tree_files:
+            _, top, _, height = self.file_tree.bbox(row)
+            after = y >= top + height / 2
+            self._drag_state["target_index"] = self.file_tree.index(row) + int(after)
+            tags = self.file_tree.item(row, "tags")
+            self._drag_state.update(target_row=row, target_tags=tags)
+            self.file_tree.item(row, tags=("drop_target",) + tuple(tags))
+            position = "后面" if after else "前面"
+            self.status_var.set(f"松开鼠标，移到 {self._tree_files[row]['name']} {position}")
+        else:
+            self._drag_state["target_index"] = 0 if y < 35 else len(self._tree_files)
+
+    def _on_drag_motion(self, event):
+        state = self._drag_state
+        if state is None:
+            return
+        if not state["active"] and abs(event.y - state["start_y"]) + abs(event.x - state["start_x"]) < 5:
+            return "break"
+        state["active"] = True
+        state["pointer_y"] = event.y
+        self.file_tree.configure(cursor="fleur")
+        self._update_drop_target(event.y)
+        if self._drag_scroll_job is None:
+            self._autoscroll_drag()
+        return "break"
+
+    def _autoscroll_drag(self):
+        self._drag_scroll_job = None
+        if not self._drag_state or not self._drag_state["active"]:
+            return
+        y = self._drag_state["pointer_y"]
+        direction = -1 if y < 40 else 1 if y > self.file_tree.winfo_height() - 24 else 0
+        if direction:
+            self.file_tree.yview_scroll(direction, "units")
+            self._update_drop_target(y)
+            self._drag_scroll_job = self.root.after(120, self._autoscroll_drag)
+
+    def _cancel_drag(self, event=None):
+        if self._drag_scroll_job is not None:
+            self.root.after_cancel(self._drag_scroll_job)
+            self._drag_scroll_job = None
+        if self._drag_state is not None:
+            self._clear_drop_target()
+            self.file_tree.configure(cursor="")
+            self._drag_state = None
+            return "break"
+
+    def _on_drag_end(self, event):
+        state = self._drag_state
+        if state is None:
+            return
+        if state["active"]:
+            self._update_drop_target(event.y)
+        self._cancel_drag()
+        if state["active"] and state["target_index"] is not None:
+            if self._reorder_files(state["paths"], state["target_index"]):
+                self.sort_mode.set("手动排序")
+                self._redraw_order(state["paths"])
+        return "break"
 
     def _create_statusbar(self):
         """创建底部状态栏"""
@@ -525,16 +803,20 @@ class BatchRenameApp:
                 except Exception as e:
                     print(f"读取文件信息失败: {full_path}, 错误: {e}")
 
+            self._remember_import_order(reset=True)
+            self.enable_reverse.set(False)
+            self.sort_mode.set("手动排序")
             self.path_var.set(f"已选择 {len(self.files)} 个文件")
             self._update_file_tree()
             self.status_var.set(f"已加载 {len(self.files)} 个文件")
             self.file_count_var.set(f"文件数: {len(self.files)}")
 
-    def _load_files(self):
+    def _load_files(self, preserve_order=False):
         """加载文件列表"""
         if not self.current_dir:
             return False
 
+        previous = {self._path_key(f["path"]): i for i, f in enumerate(self.files)}
         self.files = []
         try:
             for item in sorted(os.listdir(self.current_dir)):
@@ -558,6 +840,16 @@ class BatchRenameApp:
             messagebox.showerror("错误", f"无法读取文件夹，请检查路径和访问权限。\n{e}")
             return False
 
+        if preserve_order:
+            self.files.sort(key=lambda f: (
+                previous.get(self._path_key(f["path"]), len(previous)),
+                self._natural_name_key(f["name"]),
+            ))
+        else:
+            self.files.sort(key=lambda f: self._natural_name_key(f["name"]))
+            self.enable_reverse.set(False)
+            self.sort_mode.set("手动排序")
+        self._remember_import_order(reset=not preserve_order)
         self._update_file_tree()
         self.status_var.set(f"已加载 {len(self.files)} 个文件")
         self.file_count_var.set(f"文件数: {len(self.files)}")
@@ -585,13 +877,20 @@ class BatchRenameApp:
             self.status_var.set(f"已刷新 {len(self.files)} 个文件")
             self.file_count_var.set(f"文件数: {len(self.files)}")
         elif self.current_dir:
-            if self._load_files():
+            if self._load_files(preserve_order=True):
                 self.status_var.set("已刷新")
 
-    def _update_file_tree(self, new_names=None):
+    def _update_file_tree(self, new_names=None, selected_paths=None):
         """更新文件树显示"""
+        if selected_paths is None:
+            selected_paths = self._selected_file_paths()
+        selected_keys = {self._path_key(path) for path in selected_paths}
+        self._cancel_drag()
+        self._preview_active = new_names is not None
         for item in self.file_tree.get_children():
             self.file_tree.delete(item)
+        self._tree_files = {}
+        selected_rows = []
 
         filtered_files = self._get_ordered_files()
 
@@ -608,14 +907,23 @@ class BatchRenameApp:
 
             time_str = file_info["mtime"].strftime("%Y-%m-%d %H:%M")
 
-            item_id = self.file_tree.insert(
-                "", tk.END, values=(i, file_info["name"], new_name, size_str, time_str)
+            item_id = f"file{i}"
+            self.file_tree.insert(
+                "", tk.END, iid=item_id,
+                values=(i, file_info["name"], new_name, size_str, time_str),
             )
+            self._tree_files[item_id] = file_info
+            if self._path_key(file_info["path"]) in selected_keys:
+                selected_rows.append(item_id)
 
             if new_name and new_name != file_info["name"]:
                 self.file_tree.item(item_id, tags=("changed",))
 
         self.file_tree.tag_configure("changed", background=self.colors["preview_new"])
+        if selected_rows:
+            self.file_tree.selection_set(selected_rows)
+            self.file_tree.focus(selected_rows[0])
+            self.file_tree.see(selected_rows[0])
 
     def _apply_filter(self, files):
         """应用过滤条件"""
@@ -903,6 +1211,10 @@ class BatchRenameApp:
     def _update_file_paths(self, records):
         # 一次性匹配原路径，避免名称互换时把同一项更新两次。
         paths = {self._path_key(record["old_path"]): record["new_path"] for record in records}
+        self._import_order = {
+            self._path_key(paths.get(key, key)): position
+            for key, position in self._import_order.items()
+        }
         for file_info in self.files:
             new_path = paths.get(self._path_key(file_info["path"]))
             if new_path is not None:
