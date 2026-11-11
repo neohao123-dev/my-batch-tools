@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-批量文件重命名工具 v2.0
+批量文件重命名工具 v2.1
 Author: WorkBuddy
 Description: Windows 桌面版批量文件重命名软件 - 增强版
 支持多选功能组合、倒序排序、删除指定文字等
@@ -13,6 +13,15 @@ import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
+from uuid import uuid4
+
+
+class RenameBatchError(Exception):
+    """批量操作失败；remaining 记录未能恢复原名的文件当前位置。"""
+
+    def __init__(self, error, remaining):
+        super().__init__(str(error))
+        self.remaining = remaining
 
 
 class BatchRenameApp:
@@ -20,7 +29,7 @@ class BatchRenameApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("批量文件重命名工具 v2.0")
+        self.root.title("批量文件重命名工具 v2.1")
         self.root.geometry("1100x750")
         self.root.minsize(900, 650)
 
@@ -501,6 +510,7 @@ class BatchRenameApp:
         file_paths = filedialog.askopenfilenames(title="选择要重命名的文件")
         if file_paths:
             self.selection_mode = "files"
+            self.current_dir = ""
             self.files = []
             for full_path in file_paths:
                 try:
@@ -523,7 +533,7 @@ class BatchRenameApp:
     def _load_files(self):
         """加载文件列表"""
         if not self.current_dir:
-            return
+            return False
 
         self.files = []
         try:
@@ -540,17 +550,22 @@ class BatchRenameApp:
                             "dir": self.current_dir,
                         }
                     )
-        except PermissionError:
-            messagebox.showerror("错误", "没有权限访问该文件夹")
-            return
+        except OSError as e:
+            self.files = []
+            self._update_file_tree()
+            self.status_var.set("加载文件夹失败")
+            self.file_count_var.set("文件数: 0")
+            messagebox.showerror("错误", f"无法读取文件夹，请检查路径和访问权限。\n{e}")
+            return False
 
         self._update_file_tree()
         self.status_var.set(f"已加载 {len(self.files)} 个文件")
         self.file_count_var.set(f"文件数: {len(self.files)}")
+        return True
 
     def _refresh_files(self):
         """刷新文件列表"""
-        if self.selection_mode == "files" and self.files:
+        if self.selection_mode == "files":
             file_paths = [f["path"] for f in self.files]
             self.files = []
             for full_path in file_paths:
@@ -570,15 +585,15 @@ class BatchRenameApp:
             self.status_var.set(f"已刷新 {len(self.files)} 个文件")
             self.file_count_var.set(f"文件数: {len(self.files)}")
         elif self.current_dir:
-            self._load_files()
-            self.status_var.set("已刷新")
+            if self._load_files():
+                self.status_var.set("已刷新")
 
     def _update_file_tree(self, new_names=None):
         """更新文件树显示"""
         for item in self.file_tree.get_children():
             self.file_tree.delete(item)
 
-        filtered_files = self._apply_filter(self.files)
+        filtered_files = self._get_ordered_files()
 
         for i, file_info in enumerate(filtered_files, 1):
             new_name = new_names[i - 1] if new_names and i - 1 < len(new_names) else ""
@@ -608,12 +623,16 @@ class BatchRenameApp:
 
         ext_filter = self.filter_ext.get().strip()
         if ext_filter:
-            exts = [e.strip().lower() for e in ext_filter.split(",")]
-            filtered = [
-                f
-                for f in filtered
-                if any(f["name"].lower().endswith(ext) for ext in exts)
+            exts = [
+                "." + e.strip().lstrip(".").lower()
+                for e in re.split(r"[,，]", ext_filter)
+                if e.strip().lstrip(".")
             ]
+            if exts:
+                filtered = [
+                    f for f in filtered
+                    if any(f["name"].lower().endswith(ext) for ext in exts)
+                ]
 
         keyword = self.filter_keyword.get().strip()
         if keyword:
@@ -623,15 +642,45 @@ class BatchRenameApp:
 
         return filtered
 
+    def _get_ordered_files(self):
+        """预览、序号生成和执行始终使用同一文件顺序。"""
+        files = self._apply_filter(self.files)
+        return files[::-1] if self.enable_reverse.get() else files
+
+    @staticmethod
+    def _validate_name(name):
+        if not name or name in (".", ".."):
+            raise ValueError("文件名不能为空，也不能是 . 或 ..")
+        if re.search(r'[<>:"/\\|?*\x00-\x1f]', name):
+            raise ValueError('文件名不能包含 < > : " / \\ | ? * 或控制字符')
+        if name.endswith((".", " ")):
+            raise ValueError("文件名不能以空格或句点结尾")
+        device = name.split(".", 1)[0].rstrip(" ").upper()
+        if re.fullmatch(
+            r"CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³]",
+            device,
+        ):
+            raise ValueError("文件名不能使用 Windows 保留名称，如 CON、NUL、COM1")
+        if len(name.encode("utf-16-le", errors="surrogatepass")) // 2 > 255:
+            raise ValueError("文件名过长，请缩短后重试")
+
     def _generate_new_names(self):
         """根据当前选中的功能组合生成新文件名"""
-        filtered_files = self._apply_filter(self.files)
+        filtered_files = self._get_ordered_files()
         if not filtered_files:
+            messagebox.showinfo("提示", "没有符合过滤条件的文件")
             return None
 
-        # 如果启用倒序，先反转列表
-        if self.enable_reverse.get():
-            filtered_files = filtered_files[::-1]
+        if self.enable_sequence.get():
+            try:
+                start_num = int(self.entry_start_num.get().strip() or "1")
+                digits = int(self.entry_digits.get().strip() or "3")
+            except ValueError:
+                messagebox.showerror("错误", "起始序号和位数必须是整数！")
+                return None
+            if start_num < 0 or not 1 <= digits <= 255:
+                messagebox.showerror("错误", "起始序号不能小于 0，序号位数必须在 1 到 255 之间")
+                return None
 
         new_names = []
 
@@ -641,10 +690,9 @@ class BatchRenameApp:
 
             # 1. 删除指定文字
             if self.enable_delete_text.get():
-                delete_text = self.entry_delete_text.get().strip()
+                delete_text = self.entry_delete_text.get()
                 if delete_text:
                     base = base.replace(delete_text, "")
-                    ext = ext  # 扩展名不变
 
             # 2. 查找替换
             if self.enable_replace.get():
@@ -659,12 +707,6 @@ class BatchRenameApp:
             # 3. 序号重命名（生成基础序号）
             if self.enable_sequence.get():
                 base_name = self.entry_base_name.get().strip()
-                try:
-                    start_num = int(self.entry_start_num.get() or 1)
-                    digits = int(self.entry_digits.get() or 3)
-                except ValueError:
-                    messagebox.showerror("错误", "起始序号和位数必须是数字！")
-                    return None
                 num = str(start_num + i).zfill(digits)
                 # 基础名称为空时，直接用序号；否则用基础名称+序号
                 base = f"{base_name}{num}" if base_name else num
@@ -688,7 +730,7 @@ class BatchRenameApp:
                 if pattern:
                     try:
                         base = re.sub(pattern, replacement, base)
-                    except re.error as e:
+                    except (re.error, IndexError) as e:
                         messagebox.showerror("错误", f"正则表达式错误: {str(e)}")
                         return None
 
@@ -702,8 +744,11 @@ class BatchRenameApp:
                 elif case_mode == "title":
                     base = base.title()
                 elif case_mode == "camel":
-                    words = re.split(r"[-_\s]+", base)
-                    base = words[0].lower() + "".join(w.capitalize() for w in words[1:])
+                    words = [word for word in re.split(r"[-_\s]+", base) if word]
+                    base = (
+                        words[0].lower() + "".join(w.capitalize() for w in words[1:])
+                        if words else ""
+                    )
 
             # 8. 修改扩展名
             if self.enable_ext.get():
@@ -713,7 +758,13 @@ class BatchRenameApp:
                         new_ext = "." + new_ext
                     ext = new_ext
 
-            new_names.append(base + ext)
+            new_name = base + ext
+            try:
+                self._validate_name(new_name)
+            except ValueError as e:
+                messagebox.showerror("无效文件名", f"{name!r} → {new_name!r}\n{e}")
+                return None
+            new_names.append(new_name)
 
         return new_names
 
@@ -724,7 +775,149 @@ class BatchRenameApp:
             return
 
         self._update_file_tree(new_names)
+        try:
+            self._validate_rename_plan(self._make_rename_plan(new_names))
+        except (OSError, ValueError) as e:
+            self.status_var.set("预览发现冲突，请调整重命名选项")
+            messagebox.showerror("重命名冲突", str(e))
+            return
         self.status_var.set("预览模式 - 绿色背景表示将被修改的文件")
+
+    @staticmethod
+    def _path_key(path):
+        return os.path.normcase(os.path.abspath(path))
+
+    @staticmethod
+    def _file_id(path):
+        stat = os.lstat(path)
+        return stat.st_dev, stat.st_ino
+
+    @staticmethod
+    def _rename_file(old_path, new_path):
+        """保留重名保护，同时允许 Windows 上只修改文件名大小写。"""
+        if os.path.lexists(new_path):
+            same_path = os.path.normcase(os.path.abspath(old_path)) == os.path.normcase(
+                os.path.abspath(new_path)
+            )
+            if not same_path or not os.path.samefile(old_path, new_path):
+                raise FileExistsError("目标文件已存在")
+
+        # Windows 的 os.rename 支持大小写修改，且不会覆盖其他已有文件。
+        os.rename(old_path, new_path)
+
+    def _make_rename_plan(self, new_names):
+        return [
+            {
+                "old_path": file_info["path"],
+                "new_path": os.path.join(os.path.dirname(file_info["path"]), new_name),
+            }
+            for file_info, new_name in zip(self._get_ordered_files(), new_names)
+            if file_info["name"] != new_name
+        ]
+
+    def _validate_rename_plan(self, plan):
+        sources = {}
+        targets = set()
+        for record in plan:
+            old_path, new_path = record["old_path"], record["new_path"]
+            source_key, target_key = self._path_key(old_path), self._path_key(new_path)
+            if source_key in sources:
+                raise ValueError(f"重复选择了同一文件: {old_path}")
+            if target_key in targets:
+                raise ValueError(f"多个文件将使用同一个名称: {new_path}")
+            identity = self._file_id(old_path)
+            if "file_id" in record and record["file_id"] != identity:
+                raise OSError(f"文件已被其他文件替换，不能撤销: {old_path}")
+            sources[source_key] = old_path
+            targets.add(target_key)
+
+        for record in plan:
+            new_path = record["new_path"]
+            if os.path.lexists(new_path):
+                source = sources.get(self._path_key(new_path))
+                if source is None or not os.path.samefile(source, new_path):
+                    raise FileExistsError(f"目标文件已存在: {new_path}")
+
+    @staticmethod
+    def _temporary_path(path):
+        while True:
+            temporary = os.path.join(os.path.dirname(path), f"~br{uuid4().hex[:8]}.tmp")
+            if not os.path.lexists(temporary):
+                return temporary
+
+    def _run_rename_plan(self, plan):
+        """先暂存再改名，支持同批名称互换；失败时尽力恢复原名。"""
+        self._validate_rename_plan(plan)
+        states = [
+            dict(
+                record,
+                current_path=record["old_path"],
+                file_id=self._file_id(record["old_path"]),
+            )
+            for record in plan
+        ]
+        try:
+            for state in states:
+                temporary = self._temporary_path(state["old_path"])
+                self._rename_file(state["current_path"], temporary)
+                state["current_path"] = temporary
+            for state in states:
+                self._rename_file(state["current_path"], state["new_path"])
+                state["current_path"] = state["new_path"]
+        except OSError as error:
+            # 已完成的目标名可能占用其他文件的原名，先统一腾空再恢复。
+            for state in states:
+                if state["current_path"] == state["new_path"]:
+                    try:
+                        temporary = self._temporary_path(state["current_path"])
+                        self._rename_file(state["current_path"], temporary)
+                        state["current_path"] = temporary
+                    except OSError:
+                        pass
+            for state in states:
+                if state["current_path"] != state["old_path"]:
+                    try:
+                        self._rename_file(state["current_path"], state["old_path"])
+                        state["current_path"] = state["old_path"]
+                    except OSError:
+                        pass
+            remaining = [
+                {
+                    "old_path": state["old_path"],
+                    "new_path": state["current_path"],
+                    "file_id": state["file_id"],
+                }
+                for state in states if state["current_path"] != state["old_path"]
+            ]
+            raise RenameBatchError(error, remaining) from error
+
+        return [
+            {
+                "old_path": state["old_path"],
+                "new_path": state["new_path"],
+                "file_id": state["file_id"],
+            }
+            for state in states
+        ]
+
+    def _update_file_paths(self, records):
+        # 一次性匹配原路径，避免名称互换时把同一项更新两次。
+        paths = {self._path_key(record["old_path"]): record["new_path"] for record in records}
+        for file_info in self.files:
+            new_path = paths.get(self._path_key(file_info["path"]))
+            if new_path is not None:
+                file_info.update(
+                    path=new_path,
+                    name=os.path.basename(new_path),
+                    dir=os.path.dirname(new_path),
+                )
+
+    @staticmethod
+    def _batch_error_message(error):
+        if error.remaining:
+            paths = "\n".join(record["new_path"] for record in error.remaining)
+            return f"{error}\n\n部分文件未能恢复原名，已保留撤销记录，可解除占用后重试。文件当前位置:\n{paths}"
+        return f"{error}\n\n本次操作未完成，已恢复原文件名。"
 
     def _execute_rename(self):
         """执行重命名操作"""
@@ -752,72 +945,35 @@ class BatchRenameApp:
         if new_names is None:
             return
 
-        filtered_files = self._apply_filter(self.files)
-
-        # 如果启用倒序，需要对应调整
-        if self.enable_reverse.get():
-            filtered_files = filtered_files[::-1]
-
-        # 检查是否有变更
-        has_changes = any(
-            new != old["name"] for new, old in zip(new_names, filtered_files)
-        )
-        if not has_changes:
+        plan = self._make_rename_plan(new_names)
+        if not plan:
+            self._update_file_tree()
             messagebox.showinfo("提示", "没有需要重命名的文件")
             return
 
-        # 确认操作
-        change_count = sum(
-            1
-            for new, old in zip(new_names, filtered_files)
-            if new != old["name"]
-        )
+        try:
+            self._validate_rename_plan(plan)
+        except (OSError, ValueError) as e:
+            messagebox.showerror("无法重命名", str(e))
+            return
         if not messagebox.askyesno(
-            "确认", f"确定要重命名 {change_count} 个文件吗？"
+            "确认", f"确定要重命名 {len(plan)} 个文件吗？"
         ):
             return
 
-        # 执行重命名
-        success_count = 0
-        errors = []
-        history = []
-
-        for new_name, file_info in zip(new_names, filtered_files):
-            old_name = file_info["name"]
-            if new_name == old_name:
-                continue
-
-            old_path = file_info["path"]
-            if self.selection_mode == "files":
-                file_dir = file_info.get("dir", os.path.dirname(old_path))
-                new_path = os.path.join(file_dir, new_name)
-            else:
-                new_path = os.path.join(self.current_dir, new_name)
-
-            if os.path.exists(new_path) and old_path != new_path:
-                errors.append(f"跳过 {old_name}: 目标文件已存在")
-                continue
-
-            try:
-                history.append({"old_path": old_path, "new_path": new_path})
-                os.rename(old_path, new_path)
-                success_count += 1
-            except Exception as e:
-                errors.append(f"重命名 {old_name} 失败: {str(e)}")
-
-        if history:
-            self.rename_history.append(history)
-
-        result_msg = f"成功重命名 {success_count} 个文件"
-        if errors:
-            result_msg += f"\n\n失败 {len(errors)} 个:\n" + "\n".join(errors[:10])
-            if len(errors) > 10:
-                result_msg += f"\n... 还有 {len(errors) - 10} 个错误"
-
-        if success_count > 0:
-            messagebox.showinfo("完成", result_msg)
+        try:
+            history = self._run_rename_plan(plan)
+        except RenameBatchError as e:
+            if e.remaining:
+                self.rename_history.append(e.remaining)
+                self._update_file_paths(e.remaining)
+            messagebox.showerror("重命名失败", self._batch_error_message(e))
+        except (OSError, ValueError) as e:
+            messagebox.showerror("重命名失败", str(e))
         else:
-            messagebox.showerror("失败", result_msg)
+            self.rename_history.append(history)
+            self._update_file_paths(history)
+            messagebox.showinfo("完成", f"成功重命名 {len(history)} 个文件")
 
         self._refresh_files()
 
@@ -827,22 +983,33 @@ class BatchRenameApp:
             messagebox.showinfo("提示", "没有可撤销的操作")
             return
 
-        history = self.rename_history.pop()
-        success_count = 0
-        errors = []
-
-        for record in history:
-            try:
-                if os.path.exists(record["new_path"]):
-                    os.rename(record["new_path"], record["old_path"])
-                    success_count += 1
-            except Exception as e:
-                errors.append(f"撤销失败: {str(e)}")
-
-        if success_count > 0:
-            messagebox.showinfo("撤销完成", f"已撤销 {success_count} 个文件的重命名")
-        if errors:
-            messagebox.showerror("错误", "\n".join(errors))
+        history = self.rename_history[-1]
+        plan = [
+            dict(record, old_path=record["new_path"], new_path=record["old_path"])
+            for record in history
+        ]
+        try:
+            restored = self._run_rename_plan(plan)
+        except RenameBatchError as e:
+            self._update_file_paths(e.remaining)
+            locations = {
+                self._path_key(record["old_path"]): record["new_path"]
+                for record in e.remaining
+            }
+            for record in history:
+                record["new_path"] = locations.get(self._path_key(record["new_path"]), record["new_path"])
+            pending = [record for record in history if record["old_path"] != record["new_path"]]
+            if pending:
+                self.rename_history[-1] = pending
+            else:
+                self.rename_history.pop()
+            messagebox.showerror("撤销失败", self._batch_error_message(e))
+        except (OSError, ValueError) as e:
+            messagebox.showerror("撤销失败", f"{e}\n\n已保留撤销记录，处理后可重试。")
+        else:
+            self.rename_history.pop()
+            self._update_file_paths(restored)
+            messagebox.showinfo("撤销完成", f"已撤销 {len(restored)} 个文件的重命名")
 
         self._refresh_files()
 
